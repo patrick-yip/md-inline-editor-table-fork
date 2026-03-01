@@ -13,6 +13,7 @@ import type {
   ListItem,
   ThematicBreak,
   Text,
+  Table,
 } from "mdast";
 import { getRemarkProcessorSync, getRemarkProcessor } from "./parser-remark";
 import { getEmojiMap } from "./emoji-map-loader";
@@ -33,6 +34,7 @@ export interface DecorationRange {
   url?: string; // URL for link decorations (for clickable links)
   level?: number; // Nesting level for blockquotes
   emoji?: string; // Emoji character for emoji shortcode replacements
+  replacement?: string; // Replacement text for table pipe/cell decorations
 }
 
 /**
@@ -115,7 +117,11 @@ export type DecorationType =
   | "checkboxChecked"
   | "horizontalRule"
   | "frontmatter"
-  | "frontmatterDelimiter";
+  | "frontmatterDelimiter"
+  | "tablePipe"
+  | "tableSeparatorPipe"
+  | "tableSeparatorDash"
+  | "tableCell";
 
 /**
  * Type for the unified processor used to parse markdown text to a Root AST node.
@@ -395,6 +401,16 @@ export class MarkdownParser {
             case "text":
               this.processText(
                 node as Text,
+                decorations,
+                scopes,
+                currentAncestors,
+              );
+              break;
+
+            case "table":
+              this.processTable(
+                node as Table,
+                text,
                 decorations,
                 scopes,
                 currentAncestors,
@@ -2243,5 +2259,256 @@ export class MarkdownParser {
     }
 
     // No closing delimiter found - not valid frontmatter, don't apply decoration
+  }
+
+  /**
+   * Measures the display width of cell text after stripping inline markdown markers.
+   *
+   * CJK wide characters (Unicode ranges U+2E80-U+9FFF, U+F900-U+FAFF,
+   * U+FE30-U+FE4F, U+20000-U+2FA1F) count as 2 columns; all others count as 1.
+   *
+   * @param raw - Raw cell text (may contain inline markdown markers)
+   * @returns Display width in monospace columns
+   */
+  private measureCellText(raw: string): number {
+    // Strip common inline markdown markers: bold **, italic */_, code `, strikethrough ~~
+    const stripped = raw.replace(/(\*{1,3}|_{1,3}|~~|`+)/g, "");
+    let width = 0;
+    for (const char of stripped) {
+      const code = char.codePointAt(0)!;
+      if (
+        (code >= 0x2e80 && code <= 0x9fff) ||
+        (code >= 0xf900 && code <= 0xfaff) ||
+        (code >= 0xfe30 && code <= 0xfe4f) ||
+        (code >= 0x20000 && code <= 0x2fa1f)
+      ) {
+        width += 2;
+      } else {
+        width += 1;
+      }
+    }
+    return width;
+  }
+
+  /**
+   * Finds unescaped pipe positions within a line range.
+   */
+  private findPipePositions(
+    text: string,
+    lineStart: number,
+    lineEnd: number,
+  ): number[] {
+    const pipes: number[] = [];
+    for (let i = lineStart; i < lineEnd; i++) {
+      if (text[i] === "|" && (i === 0 || text[i - 1] !== "\\")) {
+        pipes.push(i);
+      }
+    }
+    return pipes;
+  }
+
+  /**
+   * Gets the line boundaries (start offset, end offset excluding newline) for a
+   * given character offset within the source text.
+   */
+  private getLineRange(text: string, offset: number): [number, number] {
+    const lineStart =
+      offset === 0 ? 0 : text.lastIndexOf("\n", offset - 1) + 1;
+    let lineEnd = text.indexOf("\n", offset);
+    if (lineEnd === -1) lineEnd = text.length;
+    return [lineStart, lineEnd];
+  }
+
+  /**
+   * Trims trailing whitespace from a line range, returning the new end offset.
+   */
+  private trimLineEnd(
+    text: string,
+    lineStart: number,
+    lineEnd: number,
+  ): number {
+    let end = lineEnd;
+    while (
+      end > lineStart &&
+      (text[end - 1] === " " || text[end - 1] === "\t")
+    ) {
+      end--;
+    }
+    return end;
+  }
+
+  /**
+   * Computes the maximum display width for each column in a table.
+   *
+   * Uses pipe positions on each row line to extract cell content, avoiding
+   * remark-gfm cell positions which include pipe characters.
+   *
+   * @param tableNode - The remark Table AST node
+   * @param source - The full normalized document text
+   * @returns Array of column widths (one per column, minimum 3)
+   */
+  private computeColumnWidths(tableNode: Table, source: string): number[] {
+    let numCols = 0;
+
+    for (const row of tableNode.children) {
+      if (!row.position || row.position.start.offset === undefined) continue;
+      const [lineStart, lineEnd] = this.getLineRange(
+        source,
+        row.position.start.offset,
+      );
+      const trimmed = this.trimLineEnd(source, lineStart, lineEnd);
+      const pipes = this.findPipePositions(source, lineStart, trimmed);
+      const cellCount = Math.max(0, pipes.length - 1);
+      if (cellCount > numCols) numCols = cellCount;
+    }
+
+    const widths: number[] = new Array(numCols).fill(3);
+
+    for (const row of tableNode.children) {
+      if (!row.position || row.position.start.offset === undefined) continue;
+      const [lineStart, lineEnd] = this.getLineRange(
+        source,
+        row.position.start.offset,
+      );
+      const trimmed = this.trimLineEnd(source, lineStart, lineEnd);
+      const pipes = this.findPipePositions(source, lineStart, trimmed);
+
+      for (let i = 0; i < pipes.length - 1 && i < numCols; i++) {
+        const cellText = source.substring(pipes[i] + 1, pipes[i + 1]).trim();
+        const w = this.measureCellText(cellText);
+        if (w > widths[i]) widths[i] = w;
+      }
+    }
+
+    return widths;
+  }
+
+  /**
+   * Processes a GFM table node and emits decorations for pipes, cells, and the separator row.
+   *
+   * Produces:
+   * - `tablePipe` decorations for `|` in header and data rows (replaced with `│`)
+   * - `tableSeparatorPipe` decorations for `|` in the separator row (replaced with `├`, `┼`, or `┤`)
+   * - `tableSeparatorDash` decorations for dash segments in the separator row (replaced with `─` repeats)
+   * - `tableCell` decorations for cell content (padded to uniform column width)
+   *
+   * Also adds a scope for the entire table so the visibility model can reveal the
+   * whole block when the cursor is inside it.
+   */
+  private processTable(
+    node: Table,
+    text: string,
+    decorations: DecorationRange[],
+    scopes: ScopeRange[],
+    ancestors: Node[],
+  ): void {
+    if (!this.hasValidPosition(node)) return;
+
+    // Don't process tables inside code blocks
+    if (this.isInCodeBlock(ancestors)) {
+      return;
+    }
+
+    const tableStart = node.position!.start.offset!;
+    const tableEnd = node.position!.end.offset!;
+    const colWidths = this.computeColumnWidths(node, text);
+
+    this.addScope(scopes, tableStart, tableEnd, "table");
+
+    for (let rowIdx = 0; rowIdx < node.children.length; rowIdx++) {
+      const row = node.children[rowIdx];
+      if (
+        !row.position ||
+        row.position.start.offset === undefined ||
+        row.position.end.offset === undefined
+      ) {
+        continue;
+      }
+
+      const rowStartOffset = row.position.start.offset;
+      const [lineStart, lineEnd] = this.getLineRange(text, rowStartOffset);
+      const trimmedLineEnd = this.trimLineEnd(text, lineStart, lineEnd);
+      const pipes = this.findPipePositions(text, lineStart, trimmedLineEnd);
+
+      for (const pipePos of pipes) {
+        decorations.push({
+          startPos: pipePos,
+          endPos: pipePos + 1,
+          type: "tablePipe",
+          replacement: "\u2502", // │
+        });
+      }
+
+      // Derive cells from pipe positions (avoids remark cell positions which include pipes)
+      for (let i = 0; i < pipes.length - 1; i++) {
+        const cellRangeStart = pipes[i] + 1;
+        const cellRangeEnd = pipes[i + 1];
+        if (cellRangeStart >= cellRangeEnd) continue;
+
+        const rawContent = text.substring(cellRangeStart, cellRangeEnd);
+        const trimmedContent = rawContent.trim();
+        const colWidth = i < colWidths.length ? colWidths[i] : 3;
+        const displayWidth = this.measureCellText(trimmedContent);
+        const padRight = Math.max(0, colWidth - displayWidth);
+
+        decorations.push({
+          startPos: cellRangeStart,
+          endPos: cellRangeEnd,
+          type: "tableCell",
+          replacement: "\u00A0" + trimmedContent + "\u00A0".repeat(padRight + 1),
+        });
+      }
+
+      // After the header row (index 0), process the separator row.
+      // remark-gfm does NOT include the separator row as a child node.
+      if (rowIdx === 0) {
+        const headerEndOffset = row.position.end.offset;
+
+        let sepLineStart = text.indexOf("\n", headerEndOffset);
+        if (sepLineStart === -1) continue;
+        sepLineStart += 1;
+
+        let sepLineEnd: number;
+        if (node.children.length > 1 && node.children[1].position) {
+          const nextRowStart = node.children[1].position.start.offset!;
+          sepLineEnd = text.lastIndexOf("\n", nextRowStart - 1);
+          if (sepLineEnd === -1 || sepLineEnd < sepLineStart) {
+            sepLineEnd = nextRowStart;
+          }
+        } else {
+          sepLineEnd = text.indexOf("\n", sepLineStart);
+          if (sepLineEnd === -1) sepLineEnd = tableEnd;
+        }
+
+        const trimmedSepEnd = this.trimLineEnd(text, sepLineStart, sepLineEnd);
+        const sepPipes = this.findPipePositions(text, sepLineStart, trimmedSepEnd);
+
+        // Use │ for separator pipes (same as data rows) and ASCII - for
+        // dashes. Box-drawing ─ (U+2500) renders wider than monospace chars
+        // in many editor fonts, causing cumulative misalignment.
+        for (let pIdx = 0; pIdx < sepPipes.length; pIdx++) {
+          decorations.push({
+            startPos: sepPipes[pIdx],
+            endPos: sepPipes[pIdx] + 1,
+            type: "tableSeparatorPipe",
+            replacement: "\u2502", // │ (same as regular pipe)
+          });
+        }
+
+        for (let pIdx = 0; pIdx < sepPipes.length - 1; pIdx++) {
+          const segStart = sepPipes[pIdx] + 1;
+          const segEnd = sepPipes[pIdx + 1];
+          if (segStart >= segEnd) continue;
+
+          const colWidth = pIdx < colWidths.length ? colWidths[pIdx] : 3;
+          decorations.push({
+            startPos: segStart,
+            endPos: segEnd,
+            type: "tableSeparatorDash",
+            replacement: "-".repeat(colWidth + 2),
+          });
+        }
+      }
+    }
   }
 }
