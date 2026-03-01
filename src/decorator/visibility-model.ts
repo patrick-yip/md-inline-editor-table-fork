@@ -190,12 +190,18 @@ export function filterDecorationsForEditor(
       }
       if (decoration.replacement !== undefined) {
         const ranges = filtered.get(decoration.type) || [];
+        const beforeOpts: Record<string, unknown> = {
+          contentText: decoration.replacement,
+        };
+        if (decoration.cellStyle) {
+          if (decoration.cellStyle.fontWeight) beforeOpts.fontWeight = decoration.cellStyle.fontWeight;
+          if (decoration.cellStyle.fontStyle) beforeOpts.fontStyle = decoration.cellStyle.fontStyle;
+          if (decoration.cellStyle.textDecoration) beforeOpts.textDecoration = decoration.cellStyle.textDecoration;
+        }
         ranges.push({
           range,
           renderOptions: {
-            before: {
-              contentText: decoration.replacement,
-            },
+            before: beforeOpts,
           },
         });
         filtered.set(decoration.type, ranges);

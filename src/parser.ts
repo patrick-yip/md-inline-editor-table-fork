@@ -35,6 +35,11 @@ export interface DecorationRange {
   level?: number; // Nesting level for blockquotes
   emoji?: string; // Emoji character for emoji shortcode replacements
   replacement?: string; // Replacement text for table pipe/cell decorations
+  cellStyle?: {
+    fontWeight?: string;
+    fontStyle?: string;
+    textDecoration?: string;
+  };
 }
 
 /**
@@ -2270,9 +2275,57 @@ export class MarkdownParser {
    * @param raw - Raw cell text (may contain inline markdown markers)
    * @returns Display width in monospace columns
    */
+  private static readonly INLINE_MARKER_RE = /(\*{1,3}|_{1,3}|~~|`+)/g;
+
+  /**
+   * Strips inline markdown markers from cell text, returning plain display text.
+   */
+  private stripCellMarkers(raw: string): string {
+    return raw.replace(MarkdownParser.INLINE_MARKER_RE, "");
+  }
+
+  /**
+   * Detects whole-cell formatting and returns CSS properties for the before
+   * pseudo-element. Returns undefined for unformatted or mixed-format cells.
+   */
+  private detectCellStyle(
+    trimmed: string,
+  ): { fontWeight?: string; fontStyle?: string; textDecoration?: string } | undefined {
+    // Order matters: check longer markers first to avoid partial matches
+    // Bold-italic: ***text*** or ___text___
+    if (
+      (trimmed.startsWith("***") && trimmed.endsWith("***")) ||
+      (trimmed.startsWith("___") && trimmed.endsWith("___"))
+    ) {
+      return { fontWeight: "bold", fontStyle: "italic" };
+    }
+    // Bold: **text** or __text__
+    if (
+      (trimmed.startsWith("**") && trimmed.endsWith("**")) ||
+      (trimmed.startsWith("__") && trimmed.endsWith("__"))
+    ) {
+      return { fontWeight: "bold" };
+    }
+    // Strikethrough: ~~text~~
+    if (trimmed.startsWith("~~") && trimmed.endsWith("~~")) {
+      return { textDecoration: "line-through" };
+    }
+    // Italic: *text* or _text_
+    if (
+      (trimmed.startsWith("*") && trimmed.endsWith("*") && trimmed.length > 2) ||
+      (trimmed.startsWith("_") && trimmed.endsWith("_") && trimmed.length > 2)
+    ) {
+      return { fontStyle: "italic" };
+    }
+    // Inline code: `text`
+    if (trimmed.startsWith("`") && trimmed.endsWith("`") && trimmed.length > 2) {
+      return { fontWeight: "normal" };
+    }
+    return undefined;
+  }
+
   private measureCellText(raw: string): number {
-    // Strip common inline markdown markers: bold **, italic */_, code `, strikethrough ~~
-    const stripped = raw.replace(/(\*{1,3}|_{1,3}|~~|`+)/g, "");
+    const stripped = this.stripCellMarkers(raw);
     let width = 0;
     for (const char of stripped) {
       const code = char.codePointAt(0)!;
@@ -2447,6 +2500,8 @@ export class MarkdownParser {
 
         const rawContent = text.substring(cellRangeStart, cellRangeEnd);
         const trimmedContent = rawContent.trim();
+        const displayContent = this.stripCellMarkers(trimmedContent);
+        const cellStyle = this.detectCellStyle(trimmedContent);
         const colWidth = i < colWidths.length ? colWidths[i] : 3;
         const displayWidth = this.measureCellText(trimmedContent);
         const padRight = Math.max(0, colWidth - displayWidth);
@@ -2455,7 +2510,8 @@ export class MarkdownParser {
           startPos: cellRangeStart,
           endPos: cellRangeEnd,
           type: "tableCell",
-          replacement: "\u00A0" + trimmedContent + "\u00A0".repeat(padRight + 1),
+          replacement: "\u00A0" + displayContent + "\u00A0".repeat(padRight + 1),
+          cellStyle,
         });
       }
 
