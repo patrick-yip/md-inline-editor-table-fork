@@ -1,6 +1,6 @@
 {
-  "name": "markdown-inline-editor-vscode",
-  "displayName": "Markdown Inline Editor",
+  "name": "md-inline-editor-table-fork",
+  "displayName": "Markdown Inline Editor (Table Fork)",
   "version": "1.16.2",
   "description": "WYSIWYG inline markdown editor - hide syntax, focus on content",
   "license": "MIT",
