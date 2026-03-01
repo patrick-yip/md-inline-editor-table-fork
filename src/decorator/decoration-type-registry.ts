@@ -29,6 +29,10 @@ import {
   FrontmatterDecorationType,
   FrontmatterDelimiterDecorationType,
   EmojiDecorationType,
+  TablePipeDecorationType,
+  TableSeparatorPipeDecorationType,
+  TableSeparatorDashDecorationType,
+  TableCellDecorationType,
 } from '../decorations';
 import type { DecorationType } from '../parser';
 
@@ -68,6 +72,10 @@ export class DecorationTypeRegistry {
   private frontmatterDecorationType!: TextEditorDecorationType;
   private frontmatterDelimiterDecorationType!: TextEditorDecorationType;
   private emojiDecorationType!: TextEditorDecorationType;
+  private tablePipeDecorationType!: TextEditorDecorationType;
+  private tableSeparatorPipeDecorationType!: TextEditorDecorationType;
+  private tableSeparatorDashDecorationType!: TextEditorDecorationType;
+  private tableCellDecorationType!: TextEditorDecorationType;
 
   private decorationTypeMap = new Map<DecorationType, TextEditorDecorationType>();
 
@@ -101,6 +109,10 @@ export class DecorationTypeRegistry {
     this.frontmatterDecorationType = FrontmatterDecorationType();
     this.frontmatterDelimiterDecorationType = FrontmatterDelimiterDecorationType(this.options.getFrontmatterDelimiterOpacity());
     this.emojiDecorationType = EmojiDecorationType();
+    this.tablePipeDecorationType = TablePipeDecorationType();
+    this.tableSeparatorPipeDecorationType = TableSeparatorPipeDecorationType();
+    this.tableSeparatorDashDecorationType = TableSeparatorDashDecorationType();
+    this.tableCellDecorationType = TableCellDecorationType();
 
     this.decorationTypeMap = new Map<DecorationType, TextEditorDecorationType>([
       ['hide', this.hideDecorationType],
@@ -130,6 +142,10 @@ export class DecorationTypeRegistry {
       ['frontmatter', this.frontmatterDecorationType],
       ['frontmatterDelimiter', this.frontmatterDelimiterDecorationType],
       ['emoji', this.emojiDecorationType],
+      ['tablePipe', this.tablePipeDecorationType],
+      ['tableSeparatorPipe', this.tableSeparatorPipeDecorationType],
+      ['tableSeparatorDash', this.tableSeparatorDashDecorationType],
+      ['tableCell', this.tableCellDecorationType],
       // Keep this last so it is applied after backgrounds.
       ['selectionOverlay', this.selectionOverlayDecorationType],
     ]);

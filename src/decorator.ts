@@ -582,6 +582,7 @@ export class Decorator {
           startPos: scope.startPos,
           endPos: scope.endPos,
           range,
+          kind: scope.kind,
         });
       }
     }
@@ -627,6 +628,11 @@ export class Decorator {
       return;
     }
 
+    // Types that use per-range renderOptions (DecorationOptions, not plain Range)
+    const renderOptionsTypes = new Set<DecorationType>([
+      'emoji', 'tablePipe', 'tableSeparatorPipe', 'tableSeparatorDash', 'tableCell',
+    ]);
+
     // Apply all decorations by iterating through the type map
     for (const [type, decorationType] of this.decorationTypes.getMap().entries()) {
       if (type === 'emoji') {
@@ -636,6 +642,12 @@ export class Decorator {
         }
         const emojiRanges = filteredDecorations.get(type) as DecorationOptions[] | undefined;
         this.activeEditor.setDecorations(decorationType, emojiRanges || []);
+        continue;
+      }
+
+      if (renderOptionsTypes.has(type)) {
+        const optionsRanges = filteredDecorations.get(type) as DecorationOptions[] | undefined;
+        this.activeEditor.setDecorations(decorationType, optionsRanges || []);
         continue;
       }
 
