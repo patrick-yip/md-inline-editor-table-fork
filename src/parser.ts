@@ -2465,6 +2465,7 @@ export class MarkdownParser {
     const tableStart = node.position!.start.offset!;
     const tableEnd = node.position!.end.offset!;
     const colWidths = this.computeColumnWidths(node, text);
+    const colAligns = node.align ?? [];
 
     this.addScope(scopes, tableStart, tableEnd, "table");
 
@@ -2504,13 +2505,26 @@ export class MarkdownParser {
         const cellStyle = this.detectCellStyle(trimmedContent);
         const colWidth = i < colWidths.length ? colWidths[i] : 3;
         const displayWidth = this.measureCellText(trimmedContent);
-        const padRight = Math.max(0, colWidth - displayWidth);
+        const totalPad = Math.max(0, colWidth - displayWidth);
+        const align = i < colAligns.length ? colAligns[i] : null;
+
+        let replacement: string;
+        if (align === "right") {
+          replacement = "\u00A0".repeat(totalPad + 1) + displayContent + "\u00A0";
+        } else if (align === "center") {
+          const padLeft = Math.floor(totalPad / 2);
+          const padRight = totalPad - padLeft;
+          replacement = "\u00A0".repeat(padLeft + 1) + displayContent + "\u00A0".repeat(padRight + 1);
+        } else {
+          // left or null (default)
+          replacement = "\u00A0" + displayContent + "\u00A0".repeat(totalPad + 1);
+        }
 
         decorations.push({
           startPos: cellRangeStart,
           endPos: cellRangeEnd,
           type: "tableCell",
-          replacement: "\u00A0" + displayContent + "\u00A0".repeat(padRight + 1),
+          replacement,
           cellStyle,
         });
       }
