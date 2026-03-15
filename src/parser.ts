@@ -14,6 +14,7 @@ import type {
   ThematicBreak,
   Text,
   Table,
+  TableCell,
 } from "mdast";
 import { getRemarkProcessorSync, getRemarkProcessor } from "./parser-remark";
 import { getEmojiMap } from "./emoji-map-loader";
@@ -2285,8 +2286,43 @@ export class MarkdownParser {
   }
 
   /**
+   * Extracts plain display text from a TableCell AST node by walking its
+   * child tree. Avoids regex-based stripping which incorrectly removes
+   * literal underscores and asterisks (e.g. snake_case, 100*200).
+   */
+  private extractCellPlainText(cell: TableCell): string {
+    const walk = (node: Node): string => {
+      switch (node.type) {
+        case "text":
+          return (node as Text).value;
+        case "inlineCode":
+          return (node as InlineCode).value;
+        case "strong":
+        case "emphasis":
+        case "delete": {
+          const parent = node as Strong | Emphasis | Delete;
+          return parent.children.map(walk).join("");
+        }
+        default: {
+          const asParent = node as { children?: Node[] };
+          if (asParent.children) {
+            return asParent.children.map(walk).join("");
+          }
+          return "";
+        }
+      }
+    };
+    return cell.children.map(walk).join("");
+  }
+
+  /**
    * Detects whole-cell formatting and returns CSS properties for the before
    * pseudo-element. Returns undefined for unformatted or mixed-format cells.
+   *
+   * NOTE: VS Code's `before` pseudo-element can only apply one set of CSS
+   * properties to the entire contentText. Mixed formatting within a cell
+   * (e.g. "**bold** text") cannot be partially styled; those cells display
+   * as clean plain text via extractCellPlainText.
    */
   private detectCellStyle(
     trimmed: string,
@@ -2324,10 +2360,13 @@ export class MarkdownParser {
     return undefined;
   }
 
-  private measureCellText(raw: string): number {
-    const stripped = this.stripCellMarkers(raw);
+  /**
+   * Measures width of already-plain text (no marker stripping).
+   * CJK wide characters count as 2 columns; all others as 1.
+   */
+  private measureTextWidth(plain: string): number {
     let width = 0;
-    for (const char of stripped) {
+    for (const char of plain) {
       const code = char.codePointAt(0)!;
       if (
         (code >= 0x2e80 && code <= 0x9fff) ||
@@ -2344,7 +2383,17 @@ export class MarkdownParser {
   }
 
   /**
+   * Strips markers then measures width. Used as fallback when AST cells
+   * are unavailable.
+   */
+  private measureCellText(raw: string): number {
+    return this.measureTextWidth(this.stripCellMarkers(raw));
+  }
+
+  /**
    * Finds unescaped pipe positions within a line range.
+   * Counts consecutive preceding backslashes: pipe is escaped only when
+   * the count is odd (e.g. \| is escaped, \\| is not).
    */
   private findPipePositions(
     text: string,
@@ -2353,11 +2402,58 @@ export class MarkdownParser {
   ): number[] {
     const pipes: number[] = [];
     for (let i = lineStart; i < lineEnd; i++) {
-      if (text[i] === "|" && (i === 0 || text[i - 1] !== "\\")) {
-        pipes.push(i);
+      if (text[i] === "|") {
+        let backslashCount = 0;
+        let j = i - 1;
+        while (j >= lineStart && text[j] === "\\") {
+          backslashCount++;
+          j--;
+        }
+        if (backslashCount % 2 === 0) {
+          pipes.push(i);
+        }
       }
     }
     return pipes;
+  }
+
+  /**
+   * Augments pipe positions with virtual boundary markers for rows that lack
+   * leading and/or trailing pipe characters. Virtual positions enable cell
+   * boundary detection but should NOT generate tablePipe decorations.
+   */
+  private normalizePipePositions(
+    text: string,
+    lineStart: number,
+    trimmedLineEnd: number,
+    pipes: number[],
+  ): { positions: number[]; isVirtual: boolean[] } {
+    if (pipes.length === 0) {
+      return { positions: pipes, isVirtual: [] };
+    }
+
+    const positions = [...pipes];
+    const isVirtual: boolean[] = new Array(pipes.length).fill(false);
+
+    // Find first non-whitespace position on this line
+    let firstContentPos = lineStart;
+    while (firstContentPos < trimmedLineEnd && (text[firstContentPos] === " " || text[firstContentPos] === "\t")) {
+      firstContentPos++;
+    }
+
+    // Inject virtual leading boundary if first pipe is not the first content char
+    if (pipes[0] !== firstContentPos) {
+      positions.unshift(firstContentPos - 1);
+      isVirtual.unshift(true);
+    }
+
+    // Inject virtual trailing boundary if last pipe is not at the line end
+    if (pipes[pipes.length - 1] < trimmedLineEnd - 1) {
+      positions.push(trimmedLineEnd);
+      isVirtual.push(true);
+    }
+
+    return { positions, isVirtual };
   }
 
   /**
@@ -2410,25 +2506,34 @@ export class MarkdownParser {
         row.position.start.offset,
       );
       const trimmed = this.trimLineEnd(source, lineStart, lineEnd);
-      const pipes = this.findPipePositions(source, lineStart, trimmed);
+      const rawPipes = this.findPipePositions(source, lineStart, trimmed);
+      const { positions: pipes } = this.normalizePipePositions(source, lineStart, trimmed, rawPipes);
       const cellCount = Math.max(0, pipes.length - 1);
       if (cellCount > numCols) numCols = cellCount;
     }
 
     const widths: number[] = new Array(numCols).fill(3);
 
-    for (const row of tableNode.children) {
+    for (let rowIdx = 0; rowIdx < tableNode.children.length; rowIdx++) {
+      const row = tableNode.children[rowIdx];
       if (!row.position || row.position.start.offset === undefined) continue;
       const [lineStart, lineEnd] = this.getLineRange(
         source,
         row.position.start.offset,
       );
       const trimmed = this.trimLineEnd(source, lineStart, lineEnd);
-      const pipes = this.findPipePositions(source, lineStart, trimmed);
+      const rawPipes = this.findPipePositions(source, lineStart, trimmed);
+      const { positions: pipes } = this.normalizePipePositions(source, lineStart, trimmed, rawPipes);
 
       for (let i = 0; i < pipes.length - 1 && i < numCols; i++) {
-        const cellText = source.substring(pipes[i] + 1, pipes[i + 1]).trim();
-        const w = this.measureCellText(cellText);
+        const astCell = i < row.children.length ? row.children[i] as TableCell : undefined;
+        let w: number;
+        if (astCell) {
+          w = this.measureTextWidth(this.extractCellPlainText(astCell));
+        } else {
+          const cellText = source.substring(pipes[i] + 1, pipes[i + 1]).trim();
+          w = this.measureCellText(cellText);
+        }
         if (w > widths[i]) widths[i] = w;
       }
     }
@@ -2482,15 +2587,21 @@ export class MarkdownParser {
       const rowStartOffset = row.position.start.offset;
       const [lineStart, lineEnd] = this.getLineRange(text, rowStartOffset);
       const trimmedLineEnd = this.trimLineEnd(text, lineStart, lineEnd);
-      const pipes = this.findPipePositions(text, lineStart, trimmedLineEnd);
+      const rawPipes = this.findPipePositions(text, lineStart, trimmedLineEnd);
+      const { positions: pipes, isVirtual } = this.normalizePipePositions(
+        text, lineStart, trimmedLineEnd, rawPipes,
+      );
 
-      for (const pipePos of pipes) {
-        decorations.push({
-          startPos: pipePos,
-          endPos: pipePos + 1,
-          type: "tablePipe",
-          replacement: "\u2502", // │
-        });
+      // Only decorate real (non-virtual) pipes
+      for (let pIdx = 0; pIdx < pipes.length; pIdx++) {
+        if (!isVirtual[pIdx]) {
+          decorations.push({
+            startPos: pipes[pIdx],
+            endPos: pipes[pIdx] + 1,
+            type: "tablePipe",
+            replacement: "\u2502", // │
+          });
+        }
       }
 
       // Derive cells from pipe positions (avoids remark cell positions which include pipes)
@@ -2501,10 +2612,15 @@ export class MarkdownParser {
 
         const rawContent = text.substring(cellRangeStart, cellRangeEnd);
         const trimmedContent = rawContent.trim();
-        const displayContent = this.stripCellMarkers(trimmedContent);
         const cellStyle = this.detectCellStyle(trimmedContent);
         const colWidth = i < colWidths.length ? colWidths[i] : 3;
-        const displayWidth = this.measureCellText(trimmedContent);
+
+        // Use AST node for clean plain text extraction
+        const astCell = i < row.children.length ? row.children[i] as TableCell : undefined;
+        const displayContent = astCell
+          ? this.extractCellPlainText(astCell)
+          : this.stripCellMarkers(trimmedContent);
+        const displayWidth = this.measureTextWidth(displayContent);
         const totalPad = Math.max(0, colWidth - displayWidth);
         const align = i < colAligns.length ? colAligns[i] : null;
 
@@ -2551,18 +2667,23 @@ export class MarkdownParser {
         }
 
         const trimmedSepEnd = this.trimLineEnd(text, sepLineStart, sepLineEnd);
-        const sepPipes = this.findPipePositions(text, sepLineStart, trimmedSepEnd);
+        const rawSepPipes = this.findPipePositions(text, sepLineStart, trimmedSepEnd);
+        const { positions: sepPipes, isVirtual: sepIsVirtual } = this.normalizePipePositions(
+          text, sepLineStart, trimmedSepEnd, rawSepPipes,
+        );
 
         // Use │ for separator pipes (same as data rows) and ASCII - for
         // dashes. Box-drawing ─ (U+2500) renders wider than monospace chars
         // in many editor fonts, causing cumulative misalignment.
         for (let pIdx = 0; pIdx < sepPipes.length; pIdx++) {
-          decorations.push({
-            startPos: sepPipes[pIdx],
-            endPos: sepPipes[pIdx] + 1,
-            type: "tableSeparatorPipe",
-            replacement: "\u2502", // │ (same as regular pipe)
-          });
+          if (!sepIsVirtual[pIdx]) {
+            decorations.push({
+              startPos: sepPipes[pIdx],
+              endPos: sepPipes[pIdx] + 1,
+              type: "tableSeparatorPipe",
+              replacement: "\u2502", // │ (same as regular pipe)
+            });
+          }
         }
 
         for (let pIdx = 0; pIdx < sepPipes.length - 1; pIdx++) {
